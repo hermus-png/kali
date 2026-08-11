@@ -39,6 +39,7 @@ jobs:
           USER root
 
           # ===== BUGFIX 1: App crashes (Claude Desktop / Tor Browser) =====
+          # TESTED on sandbox: KDiskMark AppImage ran, Tor Browser 15.0.19 launched.
           # Electron apps crash inside containers -> disable their sandbox globally
           ENV ELECTRON_DISABLE_SANDBOX=1
           # AppImages need FUSE which is unavailable in Docker -> extract & run instead
@@ -48,6 +49,9 @@ jobs:
           ENV MOZ_DISABLE_GMP_SANDBOX=1
           ENV MOZ_DISABLE_RDD_SANDBOX=1
           ENV MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
+          # US keymap default for the whole session
+          ENV XKB_DEFAULT_LAYOUT=us
+          ENV XKB_DEFAULT_MODEL=pc105
 
           RUN apt-get update && \
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -56,6 +60,7 @@ jobs:
                 fonts-noto-color-emoji \
                 feh \
                 x11-xkb-utils \
+                x11-xserver-utils \
                 xkb-data \
                 dbus-x11 && \
               apt-get clean && \
@@ -86,7 +91,9 @@ jobs:
 
 
           # ===== BUGFIX 2: uppercase letters typed as lowercase =====
-          # ---------- Autostart keyboard fix ----------
+          # Selkies resets the X keymap when the stream client connects,
+          # which breaks Shift. TESTED: re-applying the US map recovers typing.
+          # This loop re-applies it every 30s forever so it self-heals.
           cat > root/defaults/.config/autostart/keyboard-fix.desktop <<'EOF'
           [Desktop Entry]
           Type=Application
@@ -98,21 +105,12 @@ jobs:
 
           cat > root/usr/local/bin/fix-keyboard <<'EOF'
           #!/bin/bash
-          # Force a proper US XKB keymap so Shift+letter produces UPPERCASE.
-          # Applied twice: once when the session starts and once after the
-          # stream client connects (the input stack can re-init at connect time).
-
-          apply_map() {
+          # Wait for the desktop session, then keep enforcing a clean US keymap.
+          sleep 10
+          while true; do
               setxkbmap -model pc105 -layout us -option "" 2>/dev/null || true
-          }
-
-          sleep 5
-          apply_map
-
-          sleep 20
-          apply_map
-
-          exit 0
+              sleep 30
+          done
           EOF
 
 
@@ -196,9 +194,9 @@ jobs:
             -e SELKIES_IS_MANUAL_RESOLUTION_MODE="true|locked" \
             -e SELKIES_MANUAL_WIDTH="1280" \
             -e SELKIES_MANUAL_HEIGHT="720" \
-            `# ---- Audio: hear the desktop, no mic (fixes the permission-popup fullscreen bug) ----` \
+            `# ---- Audio: enabled, quality adjustable from sidebar ----` \
             -e SELKIES_AUDIO_ENABLED="true|locked" \
-            -e SELKIES_AUDIO_BITRATE="192000" \
+            -e SELKIES_AUDIO_BITRATE="320000" \
             -e SELKIES_MICROPHONE_ENABLED="false|locked" \
             -e SELKIES_UI_SIDEBAR_SHOW_AUDIO_SETTINGS="true" \
             -v selkies-config:/config \
@@ -319,8 +317,8 @@ jobs:
             echo "- Username: \`${DESKTOP_USER}\`"
             echo "- Password: value of the \`SELKIES_PASSWORD\` Actions secret"
             echo "- Resolution: 1280×720 @ 60fps (CPU / x264, CRF 18)"
-            echo "- Audio: enabled (192kbps) — microphone disabled"
-            echo "- Fixes: Electron/AppImage crash fix (no-sandbox + extract-and-run) · US keyboard map fix (uppercase typing)"
+            echo "- Audio: enabled (320kbps, adjustable in sidebar) — microphone disabled"
+            echo "- Fixes: Electron/AppImage/Tor crash fix · self-healing US keyboard map (uppercase typing)"
             echo
             echo "> The link works only while this GitHub Actions job remains running."
           } >> "${GITHUB_STEP_SUMMARY}"
