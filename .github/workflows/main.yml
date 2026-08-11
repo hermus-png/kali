@@ -32,24 +32,46 @@ jobs:
 
           mkdir -p root/defaults/.config/autostart root/usr/local/bin
 
-          # ---------- Dockerfile: Kali + browser + fonts ----------
+          # ---------- Dockerfile: Kali + browser + fonts + BUGFIXES ----------
           cat > Dockerfile <<'EOF'
           FROM lscr.io/linuxserver/kali-linux:latest
 
           USER root
+
+          # ===== BUGFIX 1: App crashes (Claude Desktop / Tor Browser) =====
+          # Electron apps crash inside containers -> disable their sandbox globally
+          ENV ELECTRON_DISABLE_SANDBOX=1
+          # AppImages need FUSE which is unavailable in Docker -> extract & run instead
+          ENV APPIMAGE_EXTRACT_AND_RUN=1
+          # Firefox/Tor Browser sandbox crashes inside containers
+          ENV MOZ_DISABLE_CONTENT_SANDBOX=1
+          ENV MOZ_DISABLE_GMP_SANDBOX=1
+          ENV MOZ_DISABLE_RDD_SANDBOX=1
+          ENV MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
 
           RUN apt-get update && \
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
                 firefox-esr \
                 fonts-noto \
                 fonts-noto-color-emoji \
-                feh && \
+                feh \
+                x11-xkb-utils \
+                xkb-data \
+                dbus-x11 && \
+              apt-get clean && \
+              rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+          # FUSE userspace lib so some AppImages can mount directly (name differs per distro)
+          RUN apt-get update && \
+              (DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libfuse2 || \
+               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libfuse2t64 || \
+               true) && \
               apt-get clean && \
               rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
           COPY root/ /
 
-          RUN chmod +x /usr/local/bin/set-wallpaper
+          RUN chmod +x /usr/local/bin/set-wallpaper /usr/local/bin/fix-keyboard
           EOF
 
 
@@ -60,6 +82,37 @@ jobs:
           Name=Set Wallpaper
           Exec=/usr/local/bin/set-wallpaper
           X-GNOME-Autostart-enabled=true
+          EOF
+
+
+          # ===== BUGFIX 2: uppercase letters typed as lowercase =====
+          # ---------- Autostart keyboard fix ----------
+          cat > root/defaults/.config/autostart/keyboard-fix.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Fix Keyboard Layout
+          Exec=/usr/local/bin/fix-keyboard
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+
+          cat > root/usr/local/bin/fix-keyboard <<'EOF'
+          #!/bin/bash
+          # Force a proper US XKB keymap so Shift+letter produces UPPERCASE.
+          # Applied twice: once when the session starts and once after the
+          # stream client connects (the input stack can re-init at connect time).
+
+          apply_map() {
+              setxkbmap -model pc105 -layout us -option "" 2>/dev/null || true
+          }
+
+          sleep 5
+          apply_map
+
+          sleep 20
+          apply_map
+
+          exit 0
           EOF
 
 
@@ -109,7 +162,7 @@ jobs:
           EOF
 
 
-          chmod +x root/usr/local/bin/set-wallpaper
+          chmod +x root/usr/local/bin/set-wallpaper root/usr/local/bin/fix-keyboard
 
       - name: Build Kali Selkies image
         shell: bash
@@ -267,6 +320,7 @@ jobs:
             echo "- Password: value of the \`SELKIES_PASSWORD\` Actions secret"
             echo "- Resolution: 1280×720 @ 60fps (CPU / x264, CRF 18)"
             echo "- Audio: enabled (192kbps) — microphone disabled"
+            echo "- Fixes: Electron/AppImage crash fix (no-sandbox + extract-and-run) · US keyboard map fix (uppercase typing)"
             echo
             echo "> The link works only while this GitHub Actions job remains running."
           } >> "${GITHUB_STEP_SUMMARY}"
