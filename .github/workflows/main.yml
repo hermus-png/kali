@@ -1,0 +1,288 @@
+name: Kali Web Desktop with Selkies & Cloudflare Tunnel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    env:
+      DESKTOP_USER: desktop
+      DESKTOP_PASSWORD: ${{ secrets.SELKIES_PASSWORD }}
+
+    steps:
+      - name: Validate required secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${DESKTOP_PASSWORD}" ]; then
+            echo "::error::Secret SELKIES_PASSWORD is missing."
+            exit 1
+          fi
+
+      - name: Create Kali customization files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p root/defaults/.config/autostart root/usr/local/bin
+
+          # ---------- Dockerfile: Kali + browser + fonts ----------
+          cat > Dockerfile <<'EOF'
+          FROM lscr.io/linuxserver/kali-linux:latest
+
+          USER root
+
+          RUN apt-get update && \
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                firefox-esr \
+                fonts-noto \
+                fonts-noto-color-emoji \
+                feh && \
+              apt-get clean && \
+              rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+          COPY root/ /
+
+          RUN chmod +x /usr/local/bin/set-wallpaper
+          EOF
+
+
+          # ---------- Autostart wallpaper ----------
+          cat > root/defaults/.config/autostart/wallpaper.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Set Wallpaper
+          Exec=/usr/local/bin/set-wallpaper
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+
+          cat > root/usr/local/bin/set-wallpaper <<'EOF'
+          #!/bin/bash
+
+          sleep 5
+
+          WALL=""
+
+          for candidate in \
+            /usr/share/backgrounds/**/*.jpg \
+            /usr/share/backgrounds/**/*.png \
+            /usr/share/backgrounds/*.jpg \
+            /usr/share/backgrounds/*.png
+          do
+              if [ -f "$candidate" ]; then
+                  WALL="$candidate"
+                  break
+              fi
+          done
+
+          [ -z "$WALL" ] && exit 0
+
+
+          # XFCE
+          if command -v xfconf-query >/dev/null 2>&1; then
+              for prop in $(xfconf-query -c xfce4-desktop -l 2>/dev/null | grep last-image || true)
+              do
+                  xfconf-query -c xfce4-desktop -p "$prop" -s "$WALL" || true
+              done
+          fi
+
+
+          # KDE
+          if command -v plasma-apply-wallpaperimage >/dev/null 2>&1; then
+              plasma-apply-wallpaperimage "$WALL" || true
+          fi
+
+
+          # fallback
+          if command -v feh >/dev/null 2>&1; then
+              feh --bg-fill "$WALL" || true
+          fi
+
+          exit 0
+          EOF
+
+
+          chmod +x root/usr/local/bin/set-wallpaper
+
+      - name: Build Kali Selkies image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull --tag kali-selkies:local .
+
+      - name: Start Kali desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker run -d \
+            --name selkies-desktop \
+            --shm-size=2gb \
+            -p 127.0.0.1:3000:3000 \
+            -e CUSTOM_USER="${DESKTOP_USER}" \
+            -e PASSWORD="${DESKTOP_PASSWORD}" \
+            -e TITLE="Kali Web Desktop" \
+            -e SELKIES_UI_TITLE="Kali Desktop" \
+            `# ---- Video: smooth CPU streaming ----` \
+            -e SELKIES_USE_CPU="true|locked" \
+            -e SELKIES_ENCODER="x264enc,jpeg" \
+            -e SELKIES_FRAMERATE="60" \
+            -e SELKIES_H264_CRF="18" \
+            -e SELKIES_JPEG_QUALITY="85" \
+            -e SELKIES_USE_PAINT_OVER_QUALITY="true" \
+            -e SELKIES_PAINT_OVER_JPEG_QUALITY="90" \
+            -e SELKIES_H264_PAINTOVER_CRF="14" \
+            -e SELKIES_USE_CSS_SCALING="true" \
+            -e SELKIES_IS_MANUAL_RESOLUTION_MODE="true|locked" \
+            -e SELKIES_MANUAL_WIDTH="1280" \
+            -e SELKIES_MANUAL_HEIGHT="720" \
+            `# ---- Audio: hear the desktop, no mic (fixes the permission-popup fullscreen bug) ----` \
+            -e SELKIES_AUDIO_ENABLED="true|locked" \
+            -e SELKIES_AUDIO_BITRATE="192000" \
+            -e SELKIES_MICROPHONE_ENABLED="false|locked" \
+            -e SELKIES_UI_SIDEBAR_SHOW_AUDIO_SETTINGS="true" \
+            -v selkies-config:/config \
+            kali-selkies:local
+
+      - name: Local Selkies readiness and HTTP tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for Selkies HTTP service..."
+          OK=0
+          for i in $(seq 1 90); do
+            if curl --fail --silent --show-error \
+              --user "${DESKTOP_USER}:${DESKTOP_PASSWORD}" \
+              --max-time 10 \
+              http://127.0.0.1:3000/ \
+              -o /tmp/selkies.html; then
+              OK=1
+              break
+            fi
+            if ! docker ps --format '{{.Names}}' | grep -qx 'selkies-desktop'; then
+              echo "::error::Selkies container stopped unexpectedly."
+              docker logs selkies-desktop || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if [ "${OK}" -ne 1 ]; then
+            echo "::error::Selkies HTTP service never responded successfully."
+            docker logs --tail 200 selkies-desktop || true
+            exit 1
+          fi
+
+          test -s /tmp/selkies.html
+          if grep -qE 'id="app"|manifest\.json|apple-touch-icon|assets/index-.*\.js' /tmp/selkies.html; then
+            echo "Local Selkies HTTP test passed (SPA shell detected)."
+          else
+            echo "::error::The page does not look like the Selkies web client."
+            head -n 80 /tmp/selkies.html || true
+            exit 1
+          fi
+
+      - name: Install cloudflared
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo curl --fail --location --retry 3 \
+            --output /usr/local/bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Start Cloudflare tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+          nohup cloudflared tunnel \
+            --url http://127.0.0.1:3000 \
+            --protocol http2 \
+            --no-autoupdate \
+            --loglevel info \
+            --logfile /tmp/cloudflared.log \
+            >/tmp/cloudflared.stdout 2>&1 &
+
+          PUBLIC_URL=""
+          for i in $(seq 1 90); do
+            PUBLIC_URL="$(grep -hEo 'https://[-a-z0-9]+\.trycloudflare\.com' \
+                /tmp/cloudflared.log /tmp/cloudflared.stdout 2>/dev/null | head -n 1 || true)"
+            [ -n "${PUBLIC_URL}" ] && break
+            sleep 2
+          done
+
+          if [ -z "${PUBLIC_URL}" ]; then
+            echo "::error::Cloudflare Quick Tunnel did not return a public URL."
+            cat /tmp/cloudflared.log /tmp/cloudflared.stdout || true
+            exit 1
+          fi
+          echo "PUBLIC_URL=${PUBLIC_URL}" >> "${GITHUB_ENV}"
+
+      - name: Public tunnel end-to-end test
+        shell: bash
+        run: |
+          set -euo pipefail
+          OK=0
+          for i in $(seq 1 30); do
+            if curl --fail --silent --show-error --location \
+              --user "${DESKTOP_USER}:${DESKTOP_PASSWORD}" \
+              --max-time 20 \
+              "${PUBLIC_URL}" \
+              -o /tmp/public-selkies.html; then
+              OK=1
+              break
+            fi
+            sleep 2
+          done
+
+          [ "${OK}" -eq 1 ] || { echo "::error::Public URL never responded."; exit 1; }
+          test -s /tmp/public-selkies.html
+
+          if grep -qE 'id="app"|manifest\.json|apple-touch-icon|assets/index-.*\.js' /tmp/public-selkies.html; then
+            echo "Public tunnel HTTP test passed."
+          else
+            echo "::error::Public URL did not serve the Selkies web client."
+            head -n 80 /tmp/public-selkies.html || true
+            exit 1
+          fi
+
+      - name: Publish desktop link
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## ✅ Kali Web Desktop is ready"
+            echo
+            echo "- Desktop URL: ${PUBLIC_URL}"
+            echo "- Username: \`${DESKTOP_USER}\`"
+            echo "- Password: value of the \`SELKIES_PASSWORD\` Actions secret"
+            echo "- Resolution: 1280×720 @ 60fps (CPU / x264, CRF 18)"
+            echo "- Audio: enabled (192kbps) — microphone disabled"
+            echo
+            echo "> The link works only while this GitHub Actions job remains running."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "Desktop URL: ${PUBLIC_URL}"
+          echo "Username: ${DESKTOP_USER}"
+
+      - name: Keep desktop alive
+        shell: bash
+        run: |
+          set -euo pipefail
+          while true; do
+            if ! docker ps --format '{{.Names}}' | grep -qx 'selkies-desktop'; then
+              echo "::error::Selkies container stopped."
+              docker logs selkies-desktop || true
+              exit 1
+            fi
+            sleep 60
+          done
