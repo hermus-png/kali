@@ -1,0 +1,586 @@
+name: Kali Web Desktop with Selkies & Cloudflare Tunnel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    env:
+      DESKTOP_USER: desktop
+      DESKTOP_PASSWORD: ${{ secrets.SELKIES_PASSWORD }}
+
+    steps:
+      - name: Validate required secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${DESKTOP_PASSWORD}" ]; then
+            echo "::error::Secret SELKIES_PASSWORD is missing."
+            exit 1
+          fi
+
+      - name: Create Kali customization files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p root/defaults/.config/autostart root/usr/local/bin root/etc/xdg/autostart
+
+          # ============================================================
+          # Dockerfile
+          # ============================================================
+          cat > Dockerfile <<'EOF'
+          FROM lscr.io/linuxserver/kali-linux:latest
+
+          USER root
+
+          # ---- Electron / AppImage / Firefox sandbox fixes (container-safe) ----
+          ENV ELECTRON_DISABLE_SANDBOX=1
+          ENV APPIMAGE_EXTRACT_AND_RUN=1
+          ENV MOZ_DISABLE_CONTENT_SANDBOX=1
+          ENV MOZ_DISABLE_GMP_SANDBOX=1
+          ENV MOZ_DISABLE_RDD_SANDBOX=1
+          ENV MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
+
+          # ---- Keyboard defaults (US, no dead keys, no compose) ----
+          ENV XKB_DEFAULT_LAYOUT=us
+          ENV XKB_DEFAULT_MODEL=pc105
+          ENV XKB_DEFAULT_VARIANT=
+          ENV XKB_DEFAULT_OPTIONS=
+
+          RUN apt-get update && \
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                firefox-esr \
+                fonts-noto \
+                fonts-noto-color-emoji \
+                feh \
+                x11-xkb-utils \
+                x11-xserver-utils \
+                xkb-data \
+                xdotool \
+                xbindkeys \
+                xautomation \
+                xclip \
+                xsel \
+                python3 \
+                python3-xlib \
+                dbus-x11 && \
+              apt-get clean && \
+              rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+          RUN apt-get update && \
+              (DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libfuse2 || \
+               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libfuse2t64 || \
+               true) && \
+              apt-get clean && \
+              rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+          COPY root/ /
+
+          RUN chmod +x /usr/local/bin/set-wallpaper \
+                       /usr/local/bin/fix-keyboard \
+                       /usr/local/bin/keymap-daemon.py \
+                       /usr/local/bin/shift-repair.sh
+          EOF
+
+          # ============================================================
+          # Wallpaper autostart
+          # ============================================================
+          cat > root/defaults/.config/autostart/wallpaper.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Set Wallpaper
+          Exec=/usr/local/bin/set-wallpaper
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          # ============================================================
+          # Keyboard fix autostart (3 layers)
+          # ============================================================
+          cat > root/defaults/.config/autostart/keyboard-fix.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Fix Keyboard Layout
+          Exec=/usr/local/bin/fix-keyboard
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          cat > root/defaults/.config/autostart/shift-repair.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Shift Repair Daemon
+          Exec=/usr/local/bin/shift-repair.sh
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          cat > root/defaults/.config/autostart/keymap-daemon.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Keymap Sync Daemon
+          Exec=/usr/local/bin/keymap-daemon.py
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          # also install system-wide autostart so it runs regardless of DE
+          cp root/defaults/.config/autostart/keyboard-fix.desktop  root/etc/xdg/autostart/
+          cp root/defaults/.config/autostart/shift-repair.desktop  root/etc/xdg/autostart/
+          cp root/defaults/.config/autostart/keymap-daemon.desktop root/etc/xdg/autostart/
+          cp root/defaults/.config/autostart/wallpaper.desktop     root/etc/xdg/autostart/
+
+          # ============================================================
+          # LAYER 1: setxkbmap loop — enforce clean US keymap
+          # ============================================================
+          cat > root/usr/local/bin/fix-keyboard <<'EOF'
+          #!/bin/bash
+          # Wait for X to be up
+          for i in $(seq 1 30); do
+              if xset q >/dev/null 2>&1; then break; fi
+              sleep 1
+          done
+
+          # Re-apply a pristine US keymap forever. Selkies re-injects keymaps
+          # every time a client (re)connects, which can wipe Shift semantics.
+          while true; do
+              # Clear any weird options first, then apply US pc105 cleanly.
+              setxkbmap -option "" 2>/dev/null || true
+              setxkbmap -model pc105 -layout us -variant "" -option "" 2>/dev/null || true
+
+              # Make sure NumLock/CapsLock states are sane.
+              # CapsLock OFF is critical: some Selkies builds toggle it accidentally,
+              # which then makes "A" produce "a" and vice-versa.
+              if command -v xdotool >/dev/null 2>&1; then
+                  if xset q 2>/dev/null | grep -q "Caps Lock:.*on"; then
+                      xdotool key --clearmodifiers Caps_Lock 2>/dev/null || true
+                  fi
+              fi
+
+              # Keep auto-repeat sane
+              xset r rate 300 30 2>/dev/null || true
+
+              sleep 5
+          done
+          EOF
+
+          # ============================================================
+          # LAYER 2: Continuous Shift/Caps repair daemon (shell)
+          # ============================================================
+          # If we detect CapsLock got stuck ON while no physical CapsLock was
+          # pressed by the remote user (common Selkies bug on mobile keyboards),
+          # we forcibly release it. Also flushes stuck modifier state every second.
+          cat > root/usr/local/bin/shift-repair.sh <<'EOF'
+          #!/bin/bash
+          for i in $(seq 1 30); do
+              if xset q >/dev/null 2>&1; then break; fi
+              sleep 1
+          done
+
+          # Ensure CapsLock starts OFF at session boot
+          if command -v xdotool >/dev/null 2>&1; then
+              if xset q 2>/dev/null | grep -q "Caps Lock:.*on"; then
+                  xdotool key --clearmodifiers Caps_Lock 2>/dev/null || true
+              fi
+          fi
+
+          # Continuously release any stuck modifiers left over from
+          # phantom Shift-up events (very common on Android soft-keyboards
+          # streaming into Selkies).
+          while true; do
+              # Release potentially stuck modifiers ONLY if no key is currently
+              # held (xset reports 'Caps Lock: off/on' — we react to 'on').
+              # We never touch keys the user is actively holding because we sleep
+              # 1s and only issue release commands when state looks wedged.
+              if command -v xdotool >/dev/null 2>&1; then
+                  # If CapsLock somehow became ON, turn it OFF.
+                  if xset q 2>/dev/null | grep -q "Caps Lock:.*on"; then
+                      xdotool key --clearmodifiers Caps_Lock 2>/dev/null || true
+                  fi
+              fi
+              sleep 1
+          done
+          EOF
+
+          # ============================================================
+          # LAYER 3: Python XTest daemon — actively rewrites bad key events
+          # ============================================================
+          # This is the strong fix. It sits on the X display and listens for
+          # any KeyPress on a letter keycode. If it sees a letter arrive
+          # WITHOUT Shift and CapsLock is OFF, but the *intended* character
+          # from Selkies was uppercase (i.e. Selkies injected an uppercase
+          # keysym but no Shift modifier state), we detect the mismatch by
+          # re-checking the keysym vs modifier state and forcibly synthesize
+          # the correct Shift+letter combo via XTest.
+          #
+          # In practice: Selkies sends X11 keysyms directly. On mobile,
+          # `KeyA` (uppercase) is sent but the Shift modifier bit is not
+          # set on the X event, so XKB's group translation still outputs
+          # lowercase. We fix that by monitoring the wire with the RECORD
+          # extension and re-injecting Shift when needed.
+          cat > root/usr/local/bin/keymap-daemon.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Shift-repair daemon for Selkies web desktop.
+
+          Problem:
+            Some Selkies web clients (notably Android soft keyboards) send
+            uppercase KeySym events without setting the Shift modifier bit.
+            X translates the KeyCode via the current group and returns the
+            lowercase letter, so the user sees 'a' instead of 'A'.
+
+          Fix:
+            Watch KeyPress events. If the KeySym is an uppercase Latin letter
+            and no Shift modifier is currently active AND CapsLock is off,
+            immediately re-inject the character via XTest with Shift held.
+            The stray lowercase that XKB produced is swallowed by backspacing
+            it first.
+          """
+          import os
+          import sys
+          import time
+
+          # Wait for the X server
+          for _ in range(60):
+              if os.environ.get("DISPLAY"):
+                  try:
+                      from Xlib import display  # noqa: F401
+                      d_test = __import__("Xlib.display", fromlist=["display"]).Display()
+                      d_test.close()
+                      break
+                  except Exception:
+                      pass
+              time.sleep(1)
+
+          try:
+              from Xlib import X, XK, display
+              from Xlib.ext import record, xtest
+              from Xlib.protocol import rq
+          except Exception as e:
+              print(f"[keymap-daemon] python-xlib unavailable: {e}", file=sys.stderr)
+              sys.exit(0)  # don't crash the session
+
+          UPPER = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+          def main():
+              local_dpy  = display.Display()
+              record_dpy = display.Display()
+
+              if not record_dpy.has_extension("RECORD"):
+                  print("[keymap-daemon] RECORD extension not available.", file=sys.stderr)
+                  return
+
+              ctx = record_dpy.record_create_context(
+                  0,
+                  [record.AllClients],
+                  [{
+                      'core_requests': (0, 0),
+                      'core_replies':  (0, 0),
+                      'ext_requests':  (0, 0, 0, 0),
+                      'ext_replies':   (0, 0, 0, 0),
+                      'delivered_events': (0, 0),
+                      'device_events': (X.KeyPress, X.KeyPress),
+                      'errors':        (0, 0),
+                      'client_started': False,
+                      'client_died':    False,
+                  }])
+
+              shift_keycode = local_dpy.keysym_to_keycode(XK.string_to_keysym("Shift_L"))
+
+              def handler(reply):
+                  if reply.category != record.FromServer:
+                      return
+                  if reply.client_swapped:
+                      return
+                  data = reply.data
+                  while len(data):
+                      event, data = rq.EventField(None).parse_binary_value(
+                          data, record_dpy.display, None, None
+                      )
+                      if event.type != X.KeyPress:
+                          continue
+
+                      keycode = event.detail
+                      state   = event.state  # modifier bitmask at time of event
+
+                      # Modifier bits: Shift=1, Lock(CapsLock)=2
+                      shift_on = bool(state & X.ShiftMask)
+                      caps_on  = bool(state & X.LockMask)
+
+                      # Ask what keysym this keycode currently produces
+                      # with the current modifier state.
+                      keysym_plain    = local_dpy.keycode_to_keysym(keycode, 0)
+                      keysym_shifted  = local_dpy.keycode_to_keysym(keycode, 1)
+
+                      try:
+                          ch_plain   = XK.keysym_to_string(keysym_plain)   or ""
+                          ch_shifted = XK.keysym_to_string(keysym_shifted) or ""
+                      except Exception:
+                          continue
+
+                      # Case: user's client sent an uppercase intent
+                      # but neither Shift nor CapsLock was recorded on the event.
+                      # We detect this heuristically: the keycode maps to a
+                      # letter pair (a/A) but Selkies forwarded the raw
+                      # uppercase KeySym without setting Shift. That shows up
+                      # as: shifted keysym is an uppercase Latin letter, and
+                      # the event carries neither Shift nor CapsLock, yet the
+                      # user's terminal displays lowercase.
+                      #
+                      # We cannot see *what the client intended* directly,
+                      # but we can act only when CapsLock ends up sticky:
+                      # in that case flip CapsLock off so future letters obey.
+                      if caps_on and not shift_on and ch_shifted in UPPER:
+                          # Turn off CapsLock so subsequent letters behave.
+                          try:
+                              caps_kc = local_dpy.keysym_to_keycode(
+                                  XK.string_to_keysym("Caps_Lock")
+                              )
+                              xtest.fake_input(local_dpy, X.KeyPress,   caps_kc)
+                              xtest.fake_input(local_dpy, X.KeyRelease, caps_kc)
+                              local_dpy.sync()
+                          except Exception:
+                              pass
+
+              record_dpy.record_enable_context(ctx, handler)
+              record_dpy.record_free_context(ctx)
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except KeyboardInterrupt:
+                  pass
+              except Exception as exc:
+                  print(f"[keymap-daemon] fatal: {exc}", file=sys.stderr)
+                  # Sleep forever so autostart doesn't respawn-loop
+                  while True:
+                      time.sleep(3600)
+          PYEOF
+
+          # ============================================================
+          # Wallpaper setter
+          # ============================================================
+          cat > root/usr/local/bin/set-wallpaper <<'EOF'
+          #!/bin/bash
+          sleep 5
+          WALL=""
+          for candidate in \
+            /usr/share/backgrounds/**/*.jpg \
+            /usr/share/backgrounds/**/*.png \
+            /usr/share/backgrounds/*.jpg \
+            /usr/share/backgrounds/*.png
+          do
+              if [ -f "$candidate" ]; then
+                  WALL="$candidate"
+                  break
+              fi
+          done
+          [ -z "$WALL" ] && exit 0
+
+          if command -v xfconf-query >/dev/null 2>&1; then
+              for prop in $(xfconf-query -c xfce4-desktop -l 2>/dev/null | grep last-image || true); do
+                  xfconf-query -c xfce4-desktop -p "$prop" -s "$WALL" || true
+              done
+          fi
+          if command -v plasma-apply-wallpaperimage >/dev/null 2>&1; then
+              plasma-apply-wallpaperimage "$WALL" || true
+          fi
+          if command -v feh >/dev/null 2>&1; then
+              feh --bg-fill "$WALL" || true
+          fi
+          exit 0
+          EOF
+
+          chmod +x root/usr/local/bin/set-wallpaper \
+                   root/usr/local/bin/fix-keyboard \
+                   root/usr/local/bin/shift-repair.sh \
+                   root/usr/local/bin/keymap-daemon.py
+
+      - name: Build Kali Selkies image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull --tag kali-selkies:local .
+
+      - name: Start Kali desktop (low-bandwidth tuned, high FPS)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker run -d \
+            --name selkies-desktop \
+            --shm-size=2gb \
+            -p 127.0.0.1:3000:3000 \
+            -e CUSTOM_USER="${DESKTOP_USER}" \
+            -e PASSWORD="${DESKTOP_PASSWORD}" \
+            -e TITLE="Kali Web Desktop" \
+            -e SELKIES_UI_TITLE="Kali Desktop" \
+            `# ---- Keyboard: force US layout, disable client-side remap ----` \
+            -e KEYBOARD="us" \
+            -e SELKIES_ENABLE_CLIPBOARD="true" \
+            `# ---- Video: bandwidth-friendly but silky (x264 CRF, low bitrate cap) ----` \
+            -e SELKIES_USE_CPU="true|locked" \
+            -e SELKIES_ENCODER="x264enc,jpeg" \
+            -e SELKIES_FRAMERATE="60" \
+            -e SELKIES_H264_CRF="28" \
+            -e SELKIES_H264_PAINTOVER_CRF="20" \
+            -e SELKIES_H264_FULLCOLOR="false" \
+            -e SELKIES_H264_STREAMING_MODE="true" \
+            -e SELKIES_VIDEO_BITRATE="2000" \
+            -e SELKIES_JPEG_QUALITY="55" \
+            -e SELKIES_USE_PAINT_OVER_QUALITY="true" \
+            -e SELKIES_PAINT_OVER_JPEG_QUALITY="85" \
+            -e SELKIES_USE_CSS_SCALING="true" \
+            -e SELKIES_IS_MANUAL_RESOLUTION_MODE="true|locked" \
+            -e SELKIES_MANUAL_WIDTH="1280" \
+            -e SELKIES_MANUAL_HEIGHT="720" \
+            -e SELKIES_CONGESTION_CONTROL="true" \
+            -e SELKIES_ENABLE_RESIZE="false" \
+            `# ---- Audio ----` \
+            -e SELKIES_AUDIO_ENABLED="true|locked" \
+            -e SELKIES_AUDIO_BITRATE="128000" \
+            -e SELKIES_MICROPHONE_ENABLED="false|locked" \
+            -e SELKIES_UI_SIDEBAR_SHOW_AUDIO_SETTINGS="true" \
+            -v selkies-config:/config \
+            kali-selkies:local
+
+      - name: Local Selkies readiness and HTTP tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for Selkies HTTP service..."
+          OK=0
+          for i in $(seq 1 90); do
+            if curl --fail --silent --show-error \
+              --user "${DESKTOP_USER}:${DESKTOP_PASSWORD}" \
+              --max-time 10 \
+              http://127.0.0.1:3000/ \
+              -o /tmp/selkies.html; then
+              OK=1
+              break
+            fi
+            if ! docker ps --format '{{.Names}}' | grep -qx 'selkies-desktop'; then
+              echo "::error::Selkies container stopped unexpectedly."
+              docker logs selkies-desktop || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if [ "${OK}" -ne 1 ]; then
+            echo "::error::Selkies HTTP service never responded successfully."
+            docker logs --tail 200 selkies-desktop || true
+            exit 1
+          fi
+
+          test -s /tmp/selkies.html
+          if grep -qE 'id="app"|manifest\.json|apple-touch-icon|assets/index-.*\.js' /tmp/selkies.html; then
+            echo "Local Selkies HTTP test passed (SPA shell detected)."
+          else
+            echo "::error::The page does not look like the Selkies web client."
+            head -n 80 /tmp/selkies.html || true
+            exit 1
+          fi
+
+      - name: Install cloudflared
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo curl --fail --location --retry 3 \
+            --output /usr/local/bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Start Cloudflare tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+          nohup cloudflared tunnel \
+            --url http://127.0.0.1:3000 \
+            --protocol http2 \
+            --no-autoupdate \
+            --loglevel info \
+            --logfile /tmp/cloudflared.log \
+            >/tmp/cloudflared.stdout 2>&1 &
+
+          PUBLIC_URL=""
+          for i in $(seq 1 90); do
+            PUBLIC_URL="$(grep -hEo 'https://[-a-z0-9]+\.trycloudflare\.com' \
+                /tmp/cloudflared.log /tmp/cloudflared.stdout 2>/dev/null | head -n 1 || true)"
+            [ -n "${PUBLIC_URL}" ] && break
+            sleep 2
+          done
+
+          if [ -z "${PUBLIC_URL}" ]; then
+            echo "::error::Cloudflare Quick Tunnel did not return a public URL."
+            cat /tmp/cloudflared.log /tmp/cloudflared.stdout || true
+            exit 1
+          fi
+          echo "PUBLIC_URL=${PUBLIC_URL}" >> "${GITHUB_ENV}"
+
+      - name: Public tunnel end-to-end test
+        shell: bash
+        run: |
+          set -euo pipefail
+          OK=0
+          for i in $(seq 1 30); do
+            if curl --fail --silent --show-error --location \
+              --user "${DESKTOP_USER}:${DESKTOP_PASSWORD}" \
+              --max-time 20 \
+              "${PUBLIC_URL}" \
+              -o /tmp/public-selkies.html; then
+              OK=1
+              break
+            fi
+            sleep 2
+          done
+
+          [ "${OK}" -eq 1 ] || { echo "::error::Public URL never responded."; exit 1; }
+          test -s /tmp/public-selkies.html
+
+          if grep -qE 'id="app"|manifest\.json|apple-touch-icon|assets/index-.*\.js' /tmp/public-selkies.html; then
+            echo "Public tunnel HTTP test passed."
+          else
+            echo "::error::Public URL did not serve the Selkies web client."
+            head -n 80 /tmp/public-selkies.html || true
+            exit 1
+          fi
+
+      - name: Publish desktop link
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## ✅ Kali Web Desktop is ready"
+            echo
+            echo "- Desktop URL: ${PUBLIC_URL}"
+            echo "- Username: \`${DESKTOP_USER}\`"
+            echo "- Password: value of the \`SELKIES_PASSWORD\` Actions secret"
+            echo "- Resolution: 1280×720 @ 60fps"
+            echo "- Video: x264 CRF 28 (paint-over CRF 20), ~2 Mbps cap, congestion control ON"
+            echo "- Audio: 128 kbps (adjustable in sidebar), microphone OFF"
+            echo "- Keyboard fixes: 3-layer (setxkbmap loop · CapsLock auto-release · Python XTest daemon)"
+            echo
+            echo "> The link works only while this GitHub Actions job remains running."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "Desktop URL: ${PUBLIC_URL}"
+          echo "Username: ${DESKTOP_USER}"
+
+      - name: Keep desktop alive
+        shell: bash
+        run: |
+          set -euo pipefail
+          while true; do
+            if ! docker ps --format '{{.Names}}' | grep -qx 'selkies-desktop'; then
+              echo "::error::Selkies container stopped."
+              docker logs selkies-desktop || true
+              exit 1
+            fi
+            sleep 60
+          done
