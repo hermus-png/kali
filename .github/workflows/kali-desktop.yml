@@ -1,0 +1,593 @@
+name: Kali Web Desktop with Selkies & Cloudflare Tunnel
+
+on:
+  workflow_dispatch:
+    inputs:
+      restore_backup:
+        description: 'Restore from latest backup on startup'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+permissions:
+  contents: write   # ← مهم: برای ساخت Release لازمه
+
+jobs:
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    env:
+      DESKTOP_USER: desktop
+      DESKTOP_PASSWORD: ${{ secrets.SELKIES_PASSWORD }}
+      BACKUP_TAG: kali-desktop-backup
+      BACKUP_FILE: kali-backup.tar.zst
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${DESKTOP_PASSWORD}" ]; then
+            echo "::error::Secret SELKIES_PASSWORD is missing."
+            exit 1
+          fi
+
+      # ============================================================
+      # STEP: Restore previous backup (if exists)
+      # ============================================================
+      - name: Restore previous session backup
+        if: ${{ inputs.restore_backup != 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "🔍 Checking for previous backup..."
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd
+
+          # Try to download latest backup from Release
+          if gh release view "${BACKUP_TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "✅ Backup release found. Downloading..."
+            mkdir -p /tmp/restore
+            cd /tmp/restore
+
+            if gh release download "${BACKUP_TAG}" \
+                --repo "${{ github.repository }}" \
+                --pattern "${BACKUP_FILE}" \
+                --clobber; then
+              echo "📦 Backup downloaded ($(du -h ${BACKUP_FILE} | cut -f1))"
+
+              # Also try to fetch pkglist
+              gh release download "${BACKUP_TAG}" \
+                --repo "${{ github.repository }}" \
+                --pattern "pkglist.txt" \
+                --clobber 2>/dev/null || true
+
+              # Prepare docker volume with restored data
+              sudo mkdir -p /var/lib/docker/volumes/selkies-config/_data
+              sudo tar --zstd -xf "${BACKUP_FILE}" \
+                -C /var/lib/docker/volumes/selkies-config/_data \
+                --strip-components=0 || {
+                echo "⚠️  Extraction had warnings, but continuing..."
+              }
+              sudo chown -R 911:911 /var/lib/docker/volumes/selkies-config/_data || true
+
+              echo "RESTORE_OK=1" >> "${GITHUB_ENV}"
+              echo "✅ Config restored from previous session"
+
+              # Save pkglist for later reinstall
+              if [ -f pkglist.txt ]; then
+                sudo cp pkglist.txt /var/lib/docker/volumes/selkies-config/_data/pkglist.txt
+                echo "📋 Package list saved for reinstall"
+              fi
+            else
+              echo "⚠️  Download failed, starting fresh"
+            fi
+          else
+            echo "ℹ️  No previous backup found (first run). Starting fresh."
+          fi
+
+      - name: Create Kali customization files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p root/defaults/.config/autostart root/usr/local/bin root/etc/xdg/autostart
+
+          # ============================================================
+          # Dockerfile
+          # ============================================================
+          cat > Dockerfile <<'EOF'
+          FROM lscr.io/linuxserver/kali-linux:latest
+
+          USER root
+
+          ENV ELECTRON_DISABLE_SANDBOX=1
+          ENV APPIMAGE_EXTRACT_AND_RUN=1
+          ENV MOZ_DISABLE_CONTENT_SANDBOX=1
+          ENV MOZ_DISABLE_GMP_SANDBOX=1
+          ENV MOZ_DISABLE_RDD_SANDBOX=1
+          ENV MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
+
+          ENV XKB_DEFAULT_LAYOUT=us
+          ENV XKB_DEFAULT_MODEL=pc105
+          ENV XKB_DEFAULT_VARIANT=
+          ENV XKB_DEFAULT_OPTIONS=
+
+          RUN apt-get update && \
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                firefox-esr \
+                fonts-noto \
+                fonts-noto-color-emoji \
+                feh \
+                x11-xkb-utils \
+                x11-xserver-utils \
+                xkb-data \
+                xdotool \
+                xbindkeys \
+                xautomation \
+                xclip \
+                xsel \
+                python3 \
+                python3-xlib \
+                zstd \
+                rsync \
+                dbus-x11 && \
+              apt-get clean && \
+              rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+          RUN apt-get update && \
+              (DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libfuse2 || \
+               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libfuse2t64 || \
+               true) && \
+              apt-get clean && \
+              rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+          COPY root/ /
+
+          RUN chmod +x /usr/local/bin/set-wallpaper \
+                       /usr/local/bin/fix-keyboard \
+                       /usr/local/bin/keymap-daemon.py \
+                       /usr/local/bin/shift-repair.sh \
+                       /usr/local/bin/restore-packages.sh
+          EOF
+
+          # ============================================================
+          # Autostart entries (wallpaper, keyboard, package restore)
+          # ============================================================
+          cat > root/defaults/.config/autostart/wallpaper.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Set Wallpaper
+          Exec=/usr/local/bin/set-wallpaper
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          cat > root/defaults/.config/autostart/keyboard-fix.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Fix Keyboard Layout
+          Exec=/usr/local/bin/fix-keyboard
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          cat > root/defaults/.config/autostart/shift-repair.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Shift Repair Daemon
+          Exec=/usr/local/bin/shift-repair.sh
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          cat > root/defaults/.config/autostart/keymap-daemon.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Keymap Sync Daemon
+          Exec=/usr/local/bin/keymap-daemon.py
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          # NEW: Restore packages on first boot after restore
+          cat > root/defaults/.config/autostart/restore-packages.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Restore Installed Packages
+          Exec=/usr/local/bin/restore-packages.sh
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          cp root/defaults/.config/autostart/keyboard-fix.desktop     root/etc/xdg/autostart/
+          cp root/defaults/.config/autostart/shift-repair.desktop     root/etc/xdg/autostart/
+          cp root/defaults/.config/autostart/keymap-daemon.desktop    root/etc/xdg/autostart/
+          cp root/defaults/.config/autostart/wallpaper.desktop        root/etc/xdg/autostart/
+          cp root/defaults/.config/autostart/restore-packages.desktop root/etc/xdg/autostart/
+
+          # ============================================================
+          # Keyboard fix scripts (same as before)
+          # ============================================================
+          cat > root/usr/local/bin/fix-keyboard <<'EOF'
+          #!/bin/bash
+          for i in $(seq 1 30); do
+              if xset q >/dev/null 2>&1; then break; fi
+              sleep 1
+          done
+          while true; do
+              setxkbmap -option "" 2>/dev/null || true
+              setxkbmap -model pc105 -layout us -variant "" -option "" 2>/dev/null || true
+              if command -v xdotool >/dev/null 2>&1; then
+                  if xset q 2>/dev/null | grep -q "Caps Lock:.*on"; then
+                      xdotool key --clearmodifiers Caps_Lock 2>/dev/null || true
+                  fi
+              fi
+              xset r rate 300 30 2>/dev/null || true
+              sleep 5
+          done
+          EOF
+
+          cat > root/usr/local/bin/shift-repair.sh <<'EOF'
+          #!/bin/bash
+          for i in $(seq 1 30); do
+              if xset q >/dev/null 2>&1; then break; fi
+              sleep 1
+          done
+          if command -v xdotool >/dev/null 2>&1; then
+              if xset q 2>/dev/null | grep -q "Caps Lock:.*on"; then
+                  xdotool key --clearmodifiers Caps_Lock 2>/dev/null || true
+              fi
+          fi
+          while true; do
+              if command -v xdotool >/dev/null 2>&1; then
+                  if xset q 2>/dev/null | grep -q "Caps Lock:.*on"; then
+                      xdotool key --clearmodifiers Caps_Lock 2>/dev/null || true
+                  fi
+              fi
+              sleep 1
+          done
+          EOF
+
+          cat > root/usr/local/bin/keymap-daemon.py <<'PYEOF'
+          #!/usr/bin/env python3
+          import os, sys, time
+          for _ in range(60):
+              if os.environ.get("DISPLAY"):
+                  try:
+                      from Xlib import display
+                      d_test = display.Display(); d_test.close(); break
+                  except Exception:
+                      pass
+              time.sleep(1)
+          try:
+              from Xlib import X, XK, display
+              from Xlib.ext import record, xtest
+              from Xlib.protocol import rq
+          except Exception as e:
+              print(f"[keymap-daemon] python-xlib unavailable: {e}", file=sys.stderr)
+              sys.exit(0)
+          UPPER = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+          def main():
+              local_dpy  = display.Display()
+              record_dpy = display.Display()
+              if not record_dpy.has_extension("RECORD"):
+                  return
+              ctx = record_dpy.record_create_context(0, [record.AllClients], [{
+                  'core_requests': (0,0), 'core_replies': (0,0),
+                  'ext_requests':  (0,0,0,0), 'ext_replies': (0,0,0,0),
+                  'delivered_events': (0,0),
+                  'device_events': (X.KeyPress, X.KeyPress),
+                  'errors': (0,0), 'client_started': False, 'client_died': False,
+              }])
+              def handler(reply):
+                  if reply.category != record.FromServer or reply.client_swapped: return
+                  data = reply.data
+                  while len(data):
+                      event, data = rq.EventField(None).parse_binary_value(data, record_dpy.display, None, None)
+                      if event.type != X.KeyPress: continue
+                      keycode, state = event.detail, event.state
+                      shift_on = bool(state & X.ShiftMask)
+                      caps_on  = bool(state & X.LockMask)
+                      keysym_shifted = local_dpy.keycode_to_keysym(keycode, 1)
+                      try:
+                          ch_shifted = XK.keysym_to_string(keysym_shifted) or ""
+                      except Exception:
+                          continue
+                      if caps_on and not shift_on and ch_shifted in UPPER:
+                          try:
+                              caps_kc = local_dpy.keysym_to_keycode(XK.string_to_keysym("Caps_Lock"))
+                              xtest.fake_input(local_dpy, X.KeyPress, caps_kc)
+                              xtest.fake_input(local_dpy, X.KeyRelease, caps_kc)
+                              local_dpy.sync()
+                          except Exception:
+                              pass
+              record_dpy.record_enable_context(ctx, handler)
+              record_dpy.record_free_context(ctx)
+          if __name__ == "__main__":
+              try: main()
+              except KeyboardInterrupt: pass
+              except Exception as exc:
+                  print(f"[keymap-daemon] fatal: {exc}", file=sys.stderr)
+                  while True: time.sleep(3600)
+          PYEOF
+
+          cat > root/usr/local/bin/set-wallpaper <<'EOF'
+          #!/bin/bash
+          sleep 5
+          WALL=""
+          for candidate in \
+            /usr/share/backgrounds/**/*.jpg \
+            /usr/share/backgrounds/**/*.png \
+            /usr/share/backgrounds/*.jpg \
+            /usr/share/backgrounds/*.png
+          do
+              if [ -f "$candidate" ]; then WALL="$candidate"; break; fi
+          done
+          [ -z "$WALL" ] && exit 0
+          if command -v xfconf-query >/dev/null 2>&1; then
+              for prop in $(xfconf-query -c xfce4-desktop -l 2>/dev/null | grep last-image || true); do
+                  xfconf-query -c xfce4-desktop -p "$prop" -s "$WALL" || true
+              done
+          fi
+          command -v plasma-apply-wallpaperimage >/dev/null 2>&1 && plasma-apply-wallpaperimage "$WALL" || true
+          command -v feh >/dev/null 2>&1 && feh --bg-fill "$WALL" || true
+          exit 0
+          EOF
+
+          # ============================================================
+          # NEW: Package restore script (runs once after restore)
+          # ============================================================
+          cat > root/usr/local/bin/restore-packages.sh <<'EOF'
+          #!/bin/bash
+          # Reinstalls packages listed in /config/pkglist.txt on first boot
+          # after a restore. Marks itself done so it doesn't run again.
+
+          PKGLIST=/config/pkglist.txt
+          MARKER=/config/.pkglist-restored
+
+          [ ! -f "$PKGLIST" ] && exit 0
+          [ -f "$MARKER" ] && exit 0
+
+          # Wait for network
+          for i in $(seq 1 30); do
+              if ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; then break; fi
+              sleep 2
+          done
+
+          # Notify user
+          if command -v notify-send >/dev/null 2>&1; then
+              notify-send "Restoring apps..." "Reinstalling your packages in background. This may take a few minutes." || true
+          fi
+
+          # Reinstall packages (root required)
+          sudo apt-get update -qq 2>/dev/null || true
+          # Filter out base packages that are always present
+          grep -vE '^(base-|libc6|coreutils|dpkg|bash|apt)' "$PKGLIST" \
+            | xargs -r sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends 2>/dev/null || true
+
+          touch "$MARKER"
+
+          if command -v notify-send >/dev/null 2>&1; then
+              notify-send "✅ Apps restored" "All previously installed apps are back." || true
+          fi
+          EOF
+
+          chmod +x root/usr/local/bin/set-wallpaper \
+                   root/usr/local/bin/fix-keyboard \
+                   root/usr/local/bin/shift-repair.sh \
+                   root/usr/local/bin/keymap-daemon.py \
+                   root/usr/local/bin/restore-packages.sh
+
+      - name: Build Kali Selkies image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull --tag kali-selkies:local .
+
+      - name: Start Kali desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker run -d \
+            --name selkies-desktop \
+            --shm-size=2gb \
+            -p 127.0.0.1:3000:3000 \
+            -e CUSTOM_USER="${DESKTOP_USER}" \
+            -e PASSWORD="${DESKTOP_PASSWORD}" \
+            -e TITLE="Kali Web Desktop" \
+            -e SELKIES_UI_TITLE="Kali Desktop" \
+            -e KEYBOARD="us" \
+            -e SELKIES_ENABLE_CLIPBOARD="true" \
+            -e SELKIES_USE_CPU="true|locked" \
+            -e SELKIES_ENCODER="x264enc,jpeg" \
+            -e SELKIES_FRAMERATE="60" \
+            -e SELKIES_H264_CRF="28" \
+            -e SELKIES_H264_PAINTOVER_CRF="20" \
+            -e SELKIES_H264_FULLCOLOR="false" \
+            -e SELKIES_H264_STREAMING_MODE="true" \
+            -e SELKIES_VIDEO_BITRATE="2000" \
+            -e SELKIES_JPEG_QUALITY="55" \
+            -e SELKIES_USE_PAINT_OVER_QUALITY="true" \
+            -e SELKIES_PAINT_OVER_JPEG_QUALITY="85" \
+            -e SELKIES_USE_CSS_SCALING="true" \
+            -e SELKIES_IS_MANUAL_RESOLUTION_MODE="true|locked" \
+            -e SELKIES_MANUAL_WIDTH="1280" \
+            -e SELKIES_MANUAL_HEIGHT="720" \
+            -e SELKIES_CONGESTION_CONTROL="true" \
+            -e SELKIES_ENABLE_RESIZE="false" \
+            -e SELKIES_AUDIO_ENABLED="true|locked" \
+            -e SELKIES_AUDIO_BITRATE="128000" \
+            -e SELKIES_MICROPHONE_ENABLED="false|locked" \
+            -e SELKIES_UI_SIDEBAR_SHOW_AUDIO_SETTINGS="true" \
+            -v selkies-config:/config \
+            kali-selkies:local
+
+      - name: Local Selkies readiness and HTTP tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Waiting for Selkies HTTP service..."
+          OK=0
+          for i in $(seq 1 90); do
+            if curl --fail --silent --show-error \
+              --user "${DESKTOP_USER}:${DESKTOP_PASSWORD}" \
+              --max-time 10 \
+              http://127.0.0.1:3000/ \
+              -o /tmp/selkies.html; then
+              OK=1; break
+            fi
+            if ! docker ps --format '{{.Names}}' | grep -qx 'selkies-desktop'; then
+              echo "::error::Selkies container stopped unexpectedly."
+              docker logs selkies-desktop || true
+              exit 1
+            fi
+            sleep 2
+          done
+          [ "${OK}" -eq 1 ] || { echo "::error::Selkies HTTP never responded."; docker logs --tail 200 selkies-desktop; exit 1; }
+          test -s /tmp/selkies.html
+          if grep -qE 'id="app"|manifest\.json|apple-touch-icon|assets/index-.*\.js' /tmp/selkies.html; then
+            echo "Local Selkies HTTP test passed."
+          else
+            echo "::error::Page is not the Selkies web client."
+            head -n 80 /tmp/selkies.html || true
+            exit 1
+          fi
+
+      - name: Install cloudflared
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo curl --fail --location --retry 3 \
+            --output /usr/local/bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Start Cloudflare tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+          nohup cloudflared tunnel \
+            --url http://127.0.0.1:3000 \
+            --protocol http2 \
+            --no-autoupdate \
+            --loglevel info \
+            --logfile /tmp/cloudflared.log \
+            >/tmp/cloudflared.stdout 2>&1 &
+
+          PUBLIC_URL=""
+          for i in $(seq 1 90); do
+            PUBLIC_URL="$(grep -hEo 'https://[-a-z0-9]+\.trycloudflare\.com' \
+                /tmp/cloudflared.log /tmp/cloudflared.stdout 2>/dev/null | head -n 1 || true)"
+            [ -n "${PUBLIC_URL}" ] && break
+            sleep 2
+          done
+          if [ -z "${PUBLIC_URL}" ]; then
+            echo "::error::Cloudflare Quick Tunnel did not return a public URL."
+            cat /tmp/cloudflared.log /tmp/cloudflared.stdout || true
+            exit 1
+          fi
+          echo "PUBLIC_URL=${PUBLIC_URL}" >> "${GITHUB_ENV}"
+
+      - name: Public tunnel end-to-end test
+        shell: bash
+        run: |
+          set -euo pipefail
+          OK=0
+          for i in $(seq 1 30); do
+            if curl --fail --silent --show-error --location \
+              --user "${DESKTOP_USER}:${DESKTOP_PASSWORD}" \
+              --max-time 20 \
+              "${PUBLIC_URL}" \
+              -o /tmp/public-selkies.html; then
+              OK=1; break
+            fi
+            sleep 2
+          done
+          [ "${OK}" -eq 1 ] || { echo "::error::Public URL never responded."; exit 1; }
+          test -s /tmp/public-selkies.html
+          if grep -qE 'id="app"|manifest\.json|apple-touch-icon|assets/index-.*\.js' /tmp/public-selkies.html; then
+            echo "Public tunnel HTTP test passed."
+          else
+            echo "::error::Public URL did not serve the Selkies web client."
+            head -n 80 /tmp/public-selkies.html || true
+            exit 1
+          fi
+
+      - name: Publish desktop link
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESTORE_STATUS="${RESTORE_OK:-0}"
+          RESTORE_MSG="🆕 Fresh session (no previous backup)"
+          [ "${RESTORE_STATUS}" = "1" ] && RESTORE_MSG="♻️  Restored from previous session"
+
+          {
+            echo "## ✅ Kali Web Desktop is ready"
+            echo
+            echo "- **Desktop URL**: ${PUBLIC_URL}"
+            echo "- **Username**: \`${DESKTOP_USER}\`"
+            echo "- **Password**: value of \`SELKIES_PASSWORD\` secret"
+            echo "- **Session**: ${RESTORE_MSG}"
+            echo "- **Auto-backup**: scheduled at ~5h30m (30 min before timeout)"
+            echo
+            echo "> The link works only while this job is running."
+            echo "> Your data (Firefox cookies, apps, files) will be backed up automatically before shutdown."
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "Desktop URL: ${PUBLIC_URL}"
+
+      # ============================================================
+      # KEEP-ALIVE + AUTO-BACKUP LOOP
+      # ============================================================
+      - name: Keep alive & auto-backup before timeout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Job started at this UTC epoch:
+          START_EPOCH=$(date +%s)
+
+          # Trigger backup after 5h30m (19800 sec). Job dies at 5h55m (355 min).
+          BACKUP_AFTER=$((5 * 3600 + 30 * 60))    # 19800
+
+          BACKED_UP=0
+
+          while true; do
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - START_EPOCH))
+
+            # Container health check
+            if ! docker ps --format '{{.Names}}' | grep -qx 'selkies-desktop'; then
+              echo "::error::Selkies container stopped."
+              docker logs selkies-desktop || true
+              # Try emergency backup before dying
+              if [ "${BACKED_UP}" -eq 0 ]; then
+                echo "⚠️  Container died. Attempting emergency backup..."
+                bash "${GITHUB_WORKSPACE}/.github/scripts/do-backup.sh" || true
+              fi
+              exit 1
+            fi
+
+            # Backup once, after 5h30m
+            if [ "${BACKED_UP}" -eq 0 ] && [ "${ELAPSED}" -ge "${BACKUP_AFTER}" ]; then
+              echo "⏰ 5h30m elapsed — triggering auto-backup..."
+              if bash "${GITHUB_WORKSPACE}/.github/scripts/do-backup.sh"; then
+                echo "✅ Auto-backup completed successfully"
+                BACKED_UP=1
+              else
+                echo "::warning::Auto-backup failed, will retry once in 60s"
+                sleep 60
+                bash "${GITHUB_WORKSPACE}/.github/scripts/do-backup.sh" && BACKED_UP=1 || {
+                  echo "::error::Auto-backup failed twice."
+                }
+              fi
+            fi
+
+            sleep 30
+          done
